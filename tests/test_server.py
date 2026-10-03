@@ -89,6 +89,49 @@ class ServerTests(unittest.TestCase):
                 self.assertTrue(app.S['sheets'][0]['favorite'])
                 self.assertEqual(len(app.S['sheets']),2)
 
+    @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg required')
+    def test_hour_checkpoint_survives_reload_and_preserves_absolute_times(self):
+        import hashlib
+        with tempfile.TemporaryDirectory(dir=TEMP.name) as folder:
+            video=Path(folder)/'hour.mp4'
+            subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=64x64:rate=1','-t','3722','-c:v','libx264','-preset','ultrafast',str(video)],check=True)
+            original=hashlib.sha256(video.read_bytes()).hexdigest()
+            app.scan(folder)
+            original_save=app.save
+            def pause_after_checkpoint():
+                original_save()
+                if app.S['videos'][0].get('completed_segments')==[0]:app.STOP.set()
+            with patch.object(app,'save',side_effect=pause_after_checkpoint):app.extract(60,False)
+            self.assertEqual(app.S['videos'][0]['status'],'待抽帧')
+            self.assertEqual(app.S['videos'][0]['completed_segments'],[0])
+            first=app.S['sheets'][0]
+            first['favorite']=True;first['analysis']={'hit':True,'reason':'keep'};app.save()
+            first_image=app.DATA/first['video_id']/(first['id']+'.jpg')
+            first_mtime=first_image.stat().st_mtime_ns
+            # Simulate a process restart by loading only on-disk state.
+            app.S=json.loads(app.STATEFILE.read_text());app.STOP.clear()
+            with patch.object(app,'extract_segment',wraps=app.extract_segment) as segment:
+                app.extract(1,True)
+                self.assertEqual(segment.call_count,1)
+                self.assertEqual(segment.call_args.args[3],3600)
+                self.assertEqual(segment.call_args.args[5:],(60,False))
+            self.assertEqual(app.S['videos'][0]['completed_segments'],[0,1])
+            self.assertEqual(app.S['videos'][0]['status'],'已完成')
+            tail=[s for s in app.S['sheets'] if s['segment']==1]
+            self.assertEqual(tail[0]['times'],[3600.0,3660.0])
+            kept=next(s for s in app.S['sheets'] if s['id']==first['id'])
+            self.assertTrue(kept['favorite']);self.assertTrue(kept['analysis']['hit'])
+            self.assertEqual(first_image.stat().st_mtime_ns,first_mtime)
+            self.assertEqual(hashlib.sha256(video.read_bytes()).hexdigest(),original)
+
+    def test_interrupted_segment_is_not_committed(self):
+        app.S['videos']=[{'id':'interrupted','path':'unused','name':'test','status':'待抽帧'}]
+        with patch.object(app,'probe',return_value=7200),patch.object(app,'extract_segment',side_effect=InterruptedError):
+            app.extract(5,True)
+        self.assertEqual(app.S['videos'][0]['completed_segments'],[])
+        self.assertEqual(app.S['sheets'],[])
+        self.assertEqual(app.S['videos'][0]['status'],'待抽帧')
+
     def test_video_stream_ranges_and_unknown_ids(self):
         path=app.DATA/'range-test.mp4';path.write_bytes(bytes(range(256))*32)
         app.S['videos']=[{'id':'known','path':str(path)}]

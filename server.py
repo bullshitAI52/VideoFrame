@@ -45,62 +45,95 @@ def scan(directory):
             snapshot.write_text(json.dumps(S,ensure_ascii=False))
         S.update(directory=str(p),videos=videos,sheets=[s for s in previous['sheets'] if s['video_id'] in {v['id'] for v in videos}],intent=previous.get('intent',''),message=f'已扫描 {len(videos)} 个视频')
         save()
+SEGMENT_SECONDS=3600
+
+def extract_segment(v,folder,segment,start_time,length,interval,threshold):
+    """Produce one checkpoint's sheets; uncommitted files are safe to overwrite."""
+    import re
+    scratch=folder/'pending'
+    scratch.mkdir(exist_ok=True)
+    for f in scratch.glob('frame_*.jpg'):f.unlink()
+    filt=f'fps=1/{interval},scale=480:-2'
+    if threshold:filt+=',mpdecimate'
+    filt+=',showinfo'
+    log=scratch/'extract.log'
+    with log.open('w') as out:
+        proc=subprocess.Popen(['ffmpeg','-hide_banner','-y','-ss',str(start_time),'-i',v['path'],'-t',str(length),'-vf',filt,'-fps_mode','vfr','-q:v','3',str(scratch/'frame_%06d.jpg')],stderr=out,stdout=subprocess.DEVNULL)
+        while proc.poll() is None:
+            if STOP.wait(.2):
+                proc.terminate()
+                try:proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:proc.kill();proc.wait()
+                break
+    if STOP.is_set():raise InterruptedError()
+    if proc.returncode and length>=interval:raise RuntimeError(log.read_text()[-500:])
+    stamps=[float(x) for x in re.findall(r'pts_time:([-+0-9.eE]+)',log.read_text())]
+    frames=sorted(scratch.glob('frame_*.jpg'))
+    if not frames:
+        first=scratch/'frame_000001.jpg'
+        subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-ss',str(start_time),'-i',v['path'],'-t',str(length),'-frames:v','1','-vf','scale=480:-2',str(first)],check=True,capture_output=True,timeout=60)
+        if not first.is_file():raise ValueError('视频未能解码出任何画面')
+        frames=[first];stamps=[0.0]
+    sheets=[]
+    for start in range(0,len(frames),16):
+        if STOP.is_set():raise InterruptedError()
+        batch=frames[start:start+16];canvas=Image.new('RGB',(1280,720),'black');times=[]
+        for j,f in enumerate(batch):
+            with Image.open(f) as im:
+                im.thumbnail((320,180));x=(j%4)*320;y=(j//4)*180
+                canvas.paste(im,(x+(320-im.width)//2,y+(180-im.height)//2))
+            relative=stamps[start+j] if start+j<len(stamps) else (start+j)*interval
+            t=start_time+relative;times.append(t)
+            ImageDraw.Draw(canvas).text((x+7,y+7),f'{j+1:02} | {int(t)//3600:02}:{int(t)%3600//60:02}:{int(t)%60:02}',fill='white',stroke_width=1,stroke_fill='black')
+        sid=f"{v['id']}_h{segment+1:04}_{start//16+1:04}"
+        target=folder/f'{sid}.jpg';temporary=folder/f'{sid}.tmp'
+        canvas.save(temporary,format='JPEG',quality=88);temporary.replace(target)
+        sheets.append({'id':sid,'video_id':v['id'],'name':v['name'],'count':len(batch),'times':times,'segment':segment,'segment_start':start_time,'favorite':False,'analysis':None})
+    if STOP.is_set():raise InterruptedError()
+    return sheets
+
 def extract(interval,threshold):
     for v in S['videos']:
         if STOP.is_set():break
         if v['status']=='已完成':continue
-        folder=DATA/v['id']; folder.mkdir(exist_ok=True)
+        folder=DATA/v['id'];folder.mkdir(exist_ok=True)
         try:
             with LOCK:
                 v['status']='抽帧中';v.pop('error',None);save()
             duration=probe(v['path'])
-            with LOCK:v['duration']=duration;save()
-            # fps supplies a bounded sampling rate; mpdecimate removes near-identical frames.
-            filt=f'fps=1/{interval},scale=480:-2'
-            if threshold:filt+=',mpdecimate'
-            filt+=',showinfo'
-            log=folder/'extract.log'
-            for f in folder.glob('frame_*.jpg'):f.unlink()
-            with log.open('w') as out:
-                proc=subprocess.Popen(['ffmpeg','-hide_banner','-y','-i',v['path'],'-vf',filt,'-fps_mode','vfr','-q:v','3',str(folder/'frame_%06d.jpg')],stderr=out,stdout=subprocess.DEVNULL)
-                while proc.poll() is None:
-                    if STOP.wait(.2):
-                        proc.terminate()
-                        try:proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:proc.kill();proc.wait()
-                        break
-            if STOP.is_set():v['status']='待抽帧';save();break
-            if proc.returncode and v['duration']>=interval:raise RuntimeError(log.read_text()[-500:])
-            import re
-            stamps=[float(x) for x in re.findall(r'pts_time:([\d.]+)',log.read_text())]
-            frames=sorted(folder.glob('frame_*.jpg')); sheets=[]
-            if not frames:
-                # fps can emit no frames for clips shorter than the sampling period.
-                first=folder/'frame_000001.jpg'
-                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-i',v['path'],'-frames:v','1','-vf','scale=480:-2',str(first)],check=True,capture_output=True,timeout=60)
-                if not first.is_file():raise ValueError('视频未能解码出任何画面')
-                frames=[first];stamps=[0.0]
-            if STOP.is_set():
-                with LOCK:v['status']='待抽帧';save()
-                break
-            for start in range(0,len(frames),16):
-                if STOP.is_set():break
-                batch=frames[start:start+16]; canvas=Image.new('RGB',(1280,720),'black'); times=[]
-                for j,f in enumerate(batch):
-                    with Image.open(f) as im:
-                        im.thumbnail((320,180)); x=(j%4)*320; y=(j//4)*180
-                        canvas.paste(im,(x+(320-im.width)//2,y+(180-im.height)//2))
-                    t=stamps[start+j] if start+j<len(stamps) else (start+j)*interval;times.append(t)
-                    ImageDraw.Draw(canvas).text((x+7,y+7),f'{j+1:02} | {int(t)//3600:02}:{int(t)%3600//60:02}:{int(t)%60:02}',fill='white',stroke_width=1,stroke_fill='black')
-                sid=f"{v['id']}_{start//16+1:04}";canvas.save(folder/f'{sid}.jpg',quality=88)
-                sheets.append({'id':sid,'video_id':v['id'],'name':v['name'],'count':len(batch),'times':times,'favorite':False,'analysis':None})
-            if STOP.is_set():
-                with LOCK:v['status']='待抽帧';save()
-                break
+            if not math.isfinite(duration) or duration<=0:raise ValueError('无法读取有效视频时长')
             with LOCK:
-                S['sheets']=[s for s in S['sheets'] if s['video_id']!=v['id']]+sheets
-                v['status']='已完成';S['message']=f"已处理 {v['name']} · {len(sheets)} 张宫格";save()
-            for f in frames:f.unlink()
+                v['duration']=duration
+                # Pin settings so resumed videos never mix different sampling rules.
+                settings=v.setdefault('extract_settings',{'interval':interval,'dedupe':threshold,'segment_seconds':SEGMENT_SECONDS})
+                segment_seconds=settings['segment_seconds']
+                total=math.ceil(duration/segment_seconds)
+                v['segments_total']=total
+                completed=v.setdefault('completed_segments',[])
+                save()
+            for segment in range(total):
+                if STOP.is_set():raise InterruptedError()
+                if segment in completed:continue
+                start_time=segment*segment_seconds
+                with LOCK:
+                    v['current_segment']=segment
+                    S['message']=f"{v['name']} · 正在处理第 {segment+1}/{total} 段（每段最多 1 小时）";save()
+                sheets=extract_segment(v,folder,segment,start_time,min(segment_seconds,duration-start_time),settings['interval'],settings['dedupe'])
+                with LOCK:
+                    if STOP.is_set():raise InterruptedError()
+                    old_sheets=S['sheets']
+                    S['sheets']=[s for s in old_sheets if not (s['video_id']==v['id'] and s.get('segment')==segment)]+sheets
+                    completed.append(segment)
+                    try:save()
+                    except Exception:
+                        completed.remove(segment);S['sheets']=old_sheets;raise
+                # Release temporary disk space after each committed hour.
+                for f in (folder/'pending').glob('frame_*.jpg'):f.unlink()
+            with LOCK:
+                v['status']='已完成';v.pop('current_segment',None);save()
+        except InterruptedError:
+            with LOCK:v['status']='待抽帧';v.pop('current_segment',None);save()
+            break
         except Exception as e:
             with LOCK:v['status']='失败';v['error']=str(e);save()
 def analyze_one(s,intent):
