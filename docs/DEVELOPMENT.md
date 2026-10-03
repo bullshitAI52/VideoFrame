@@ -20,11 +20,13 @@
 ```bash
 python3 -m py_compile server.py
 node --check static/app.js
+python3 -m unittest discover -s tests -v
+node tests/test_frontend.cjs
 ```
 
 Node.js 仅用于 JavaScript 语法检查，运行程序不需要 Node.js。
 
-首次实现时已使用合成视频验证扫描、FFmpeg 抽帧、16+2 帧宫格、图片读取、收藏、目录切换恢复及跨域请求拒绝。使用本地模拟接口验证图像请求载荷、并发分析及 JSON 解析。测试脚本尚未整理为仓库内可重复执行的测试套件。
+首次实现时已使用合成视频验证扫描、FFmpeg 抽帧、16+2 帧宫格、图片读取、收藏、目录切换恢复及跨域请求拒绝。使用本地模拟接口验证图像请求载荷、并发分析及 JSON 解析。回归测试已整理到 `tests/`，使用独立临时数据目录，不读取真实视频和密钥。覆盖短片兜底、常规宫格、目录恢复、任务互斥、异常提示、非法模型返回值，以及前端延迟刷新和配置失败。
 
 后续修改应在独立的 `VIDEOFRAME_DATA` 目录中测试，避免影响日常使用记录。测试素材应使用合成图像或获授权的内容。
 

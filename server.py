@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import base64, concurrent.futures, hashlib, io, json, mimetypes, os, shutil, subprocess, threading, time, uuid
+import base64, concurrent.futures, hashlib, math, json, mimetypes, os, shutil, subprocess, threading
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -28,13 +28,10 @@ def probe(p):
 def scan(directory):
     p=Path(directory).expanduser().resolve()
     if not p.is_dir():raise ValueError('目录不存在')
+    previous=S
     if S['directory'] != str(p):
-        if S['directory']:
-            snapshot=DATA/('workspace_'+hashlib.sha256(S['directory'].encode()).hexdigest()[:20]+'.json')
-            snapshot.write_text(json.dumps(S,ensure_ascii=False))
         previous=read(DATA/('workspace_'+hashlib.sha256(str(p).encode()).hexdigest()[:20]+'.json'),{'directory':str(p),'videos':[],'sheets':[],'intent':''})
-        S.update(previous)
-    old={v['path']:v for v in S['videos']}
+    old={v['path']:v for v in previous['videos']}
     videos=[]
     for f in sorted(p.rglob('*')):
         if f.suffix.lower() in {'.mp4','.mov','.mkv','.avi','.ts','.m4v','.webm','.mts'} and f.is_file():
@@ -43,7 +40,10 @@ def scan(directory):
             v=old.get(str(f))
             videos.append(v if v and v['id']==ident else {'id':ident,'path':str(f),'name':f.name,'status':'待抽帧','duration':0})
     with LOCK:
-        S.update(directory=str(p),videos=videos,sheets=[s for s in S['sheets'] if s['video_id'] in {v['id'] for v in videos}],message=f'已扫描 {len(videos)} 个视频')
+        if S['directory'] and S['directory'] != str(p):
+            snapshot=DATA/('workspace_'+hashlib.sha256(S['directory'].encode()).hexdigest()[:20]+'.json')
+            snapshot.write_text(json.dumps(S,ensure_ascii=False))
+        S.update(directory=str(p),videos=videos,sheets=[s for s in previous['sheets'] if s['video_id'] in {v['id'] for v in videos}],intent=previous.get('intent',''),message=f'已扫描 {len(videos)} 个视频')
         save()
 def extract(interval,threshold):
     for v in S['videos']:
@@ -51,7 +51,10 @@ def extract(interval,threshold):
         if v['status']=='已完成':continue
         folder=DATA/v['id']; folder.mkdir(exist_ok=True)
         try:
-            v['status']='抽帧中'; v['duration']=probe(v['path']);save()
+            with LOCK:
+                v['status']='抽帧中';v.pop('error',None);save()
+            duration=probe(v['path'])
+            with LOCK:v['duration']=duration;save()
             # fps supplies a bounded sampling rate; mpdecimate removes near-identical frames.
             filt=f'fps=1/{interval},scale=480:-2'
             if threshold:filt+=',mpdecimate'
@@ -61,13 +64,27 @@ def extract(interval,threshold):
             with log.open('w') as out:
                 proc=subprocess.Popen(['ffmpeg','-hide_banner','-y','-i',v['path'],'-vf',filt,'-fps_mode','vfr','-q:v','3',str(folder/'frame_%06d.jpg')],stderr=out,stdout=subprocess.DEVNULL)
                 while proc.poll() is None:
-                    if STOP.wait(.2):proc.terminate();proc.wait();break
+                    if STOP.wait(.2):
+                        proc.terminate()
+                        try:proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:proc.kill();proc.wait()
+                        break
             if STOP.is_set():v['status']='待抽帧';save();break
-            if proc.returncode:raise RuntimeError(log.read_text()[-500:])
+            if proc.returncode and v['duration']>=interval:raise RuntimeError(log.read_text()[-500:])
             import re
             stamps=[float(x) for x in re.findall(r'pts_time:([\d.]+)',log.read_text())]
             frames=sorted(folder.glob('frame_*.jpg')); sheets=[]
+            if not frames:
+                # fps can emit no frames for clips shorter than the sampling period.
+                first=folder/'frame_000001.jpg'
+                subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y','-i',v['path'],'-frames:v','1','-vf','scale=480:-2',str(first)],check=True,capture_output=True,timeout=60)
+                if not first.is_file():raise ValueError('视频未能解码出任何画面')
+                frames=[first];stamps=[0.0]
+            if STOP.is_set():
+                with LOCK:v['status']='待抽帧';save()
+                break
             for start in range(0,len(frames),16):
+                if STOP.is_set():break
                 batch=frames[start:start+16]; canvas=Image.new('RGB',(1280,720),'black'); times=[]
                 for j,f in enumerate(batch):
                     with Image.open(f) as im:
@@ -77,11 +94,15 @@ def extract(interval,threshold):
                     ImageDraw.Draw(canvas).text((x+7,y+7),f'{j+1:02} | {int(t)//3600:02}:{int(t)%3600//60:02}:{int(t)%60:02}',fill='white',stroke_width=1,stroke_fill='black')
                 sid=f"{v['id']}_{start//16+1:04}";canvas.save(folder/f'{sid}.jpg',quality=88)
                 sheets.append({'id':sid,'video_id':v['id'],'name':v['name'],'count':len(batch),'times':times,'favorite':False,'analysis':None})
+            if STOP.is_set():
+                with LOCK:v['status']='待抽帧';save()
+                break
             with LOCK:
                 S['sheets']=[s for s in S['sheets'] if s['video_id']!=v['id']]+sheets
                 v['status']='已完成';S['message']=f"已处理 {v['name']} · {len(sheets)} 张宫格";save()
             for f in frames:f.unlink()
-        except Exception as e:v['status']='失败';v['error']=str(e);save()
+        except Exception as e:
+            with LOCK:v['status']='失败';v['error']=str(e);save()
 def analyze_one(s,intent):
     if STOP.is_set():return
     try:
@@ -92,15 +113,19 @@ def analyze_one(s,intent):
         if txt.startswith('```'):txt=txt.split('\n',1)[1].rsplit('```',1)[0]
         a=json.loads(txt)
         if type(a.get('hit')) is not bool:raise ValueError('接口返回的 hit 不是布尔值')
-        a={'hit':a['hit'],'confidence':max(0,min(100,float(a.get('confidence',0)))),'reason':str(a.get('reason','')),'frames':[int(n) for n in a.get('frames',[]) if isinstance(n,int) and 1<=n<=s['count']]}
+        confidence=float(a.get('confidence',0))
+        if not math.isfinite(confidence):raise ValueError('接口返回的置信度不是有限数字')
+        if not isinstance(a.get('frames',[]),list):raise ValueError('接口返回的 frames 不是数组')
+        a={'hit':a['hit'],'confidence':max(0,min(100,confidence)),'reason':str(a.get('reason','')),'frames':[int(n) for n in a.get('frames',[]) if type(n) is int and 1<=n<=s['count']]}
         with LOCK:s['analysis']=a; s.pop('error',None);save()
     except Exception as e:
         with LOCK:s['error']=str(e)[:500];save()
 def analyze(intent,restart):
-    S['intent']=intent
-    if restart:
-        for s in S['sheets']:s['analysis']=None;s.pop('error',None)
-    save()
+    with LOCK:
+        S['intent']=intent
+        if restart:
+            for s in S['sheets']:s['analysis']=None;s.pop('error',None)
+        save()
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         pending=set()
         for s in S['sheets']:
@@ -111,14 +136,25 @@ def analyze(intent,restart):
             if not STOP.is_set():pending.add(pool.submit(analyze_one,s,intent))
 def launch(fn,*args):
     global BUSY
-    if BUSY:raise ValueError('任务正在执行，请先暂停并等待当前任务结束')
-    BUSY=True;STOP.clear()
+    with LOCK:
+        if BUSY:raise ValueError('任务正在执行，请先暂停并等待当前任务结束')
+        BUSY=True;STOP.clear()
     def run():
         global BUSY
+        error=None
         try:fn(*args)
-        except Exception as e:S['message']=str(e)
-        finally:BUSY=False;S['message']='任务已暂停' if STOP.is_set() else '任务已结束';save()
-    threading.Thread(target=run,daemon=True).start()
+        except Exception as e:error=str(e)
+        finally:
+            with LOCK:
+                BUSY=False
+                S['message']=('任务失败：'+error) if error else ('任务已暂停' if STOP.is_set() else '任务已结束（请检查各项状态）')
+                save()
+    thread=threading.Thread(target=run,daemon=True)
+    try:thread.start()
+    except Exception:
+        with LOCK:BUSY=False
+        raise
+    return thread
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def respond(self,obj,status=200):
@@ -144,36 +180,39 @@ class Handler(BaseHTTPRequestHandler):
         if 'application/json' not in self.headers.get('Content-Type',''):self.respond({'error':'需要 JSON'},415);return
         try:
             d=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))) or '{}');path=self.path
-            if path=='/api/choose':
-                if BUSY:raise ValueError('请先暂停任务')
-                p=subprocess.check_output(['osascript','-e','POSIX path of (choose folder with prompt "选择视频目录")'],text=True).strip();scan(p)
-            elif path=='/api/scan':
-                if BUSY:raise ValueError('请先暂停任务')
-                scan(d['directory'])
-            elif path=='/api/extract':
-                interval=float(d.get('interval',5))
-                if not .5<=interval<=3600:raise ValueError('抽帧间隔应为 0.5–3600 秒')
-                launch(extract,interval,bool(d.get('dedupe',True)))
-            elif path=='/api/stop':STOP.set()
-            elif path=='/api/favorite':
-                with LOCK:
-                    s=next(s for s in S['sheets'] if s['id']==d['id']);s['favorite']=not s['favorite'];save()
-            elif path=='/api/config':
-                if BUSY:raise ValueError('任务运行时不能更改接口')
-                url=d['base_url'].strip()
-                if not url.startswith(('https://','http://localhost:','http://127.0.0.1:')):raise ValueError('远程接口需使用 HTTPS')
-                C.update(base_url=url,model=d['model'].strip())
-                if d.get('key'):C['key']=d['key'].strip()
-                config_save()
-            elif path=='/api/analyze':
-                if not all(C.values()):raise ValueError('请先配置接口地址、模型和密钥')
-                intent=d.get('intent','').strip()
-                if len(intent)<10:raise ValueError('请至少输入 10 个字的分析意图')
-                if S['intent'] and intent!=S['intent'] and not d.get('restart'):raise ValueError('分析意图已更改，请点击重新分析')
-                launch(analyze,intent,bool(d.get('restart')))
-            elif path=='/api/reveal':
-                s=next(s for s in S['sheets'] if s['id']==d['id']);v=next(v for v in S['videos'] if v['id']==s['video_id']);subprocess.run(['open','-R',v['path']],check=True)
-            else:raise ValueError('未知操作')
+            with LOCK:
+                if path=='/api/choose':
+                    if BUSY:raise ValueError('请先暂停任务')
+                    p=subprocess.check_output(['osascript','-e','POSIX path of (choose folder with prompt "选择视频目录")'],text=True).strip();scan(p)
+                elif path=='/api/scan':
+                    if BUSY:raise ValueError('请先暂停任务')
+                    scan(d['directory'])
+                elif path=='/api/extract':
+                    interval=float(d.get('interval',5))
+                    if not .5<=interval<=3600:raise ValueError('抽帧间隔应为 0.5–3600 秒')
+                    if not S['videos']:raise ValueError('请先扫描视频目录')
+                    launch(extract,interval,bool(d.get('dedupe',True)))
+                elif path=='/api/stop':STOP.set()
+                elif path=='/api/favorite':
+                    with LOCK:
+                        s=next(s for s in S['sheets'] if s['id']==d['id']);s['favorite']=not s['favorite'];save()
+                elif path=='/api/config':
+                    if BUSY:raise ValueError('任务运行时不能更改接口')
+                    url=d['base_url'].strip()
+                    if not url.startswith(('https://','http://localhost:','http://127.0.0.1:')):raise ValueError('远程接口需使用 HTTPS')
+                    C.update(base_url=url,model=d['model'].strip())
+                    if d.get('key'):C['key']=d['key'].strip()
+                    config_save()
+                elif path=='/api/analyze':
+                    if not S['sheets']:raise ValueError('请先抽帧生成宫格')
+                    if not all(C.values()):raise ValueError('请先配置接口地址、模型和密钥')
+                    intent=d.get('intent','').strip()
+                    if len(intent)<10:raise ValueError('请至少输入 10 个字的分析意图')
+                    if S['intent'] and intent!=S['intent'] and not d.get('restart'):raise ValueError('分析意图已更改，请点击重新分析')
+                    launch(analyze,intent,bool(d.get('restart')))
+                elif path=='/api/reveal':
+                    s=next(s for s in S['sheets'] if s['id']==d['id']);v=next(v for v in S['videos'] if v['id']==s['video_id']);subprocess.run(['open','-R',v['path']],check=True)
+                else:raise ValueError('未知操作')
             self.respond({'ok':True})
         except Exception as e:self.respond({'error':str(e)},400)
 if __name__=='__main__':

@@ -6,7 +6,7 @@ if ! command -v python3 >/dev/null; then
 fi
 if [ ! -d .venv ]; then python3 -m venv .venv || exit 1; fi
 .venv/bin/python -c 'import PIL, requests' 2>/dev/null || .venv/bin/python -m pip install -r requirements.txt || exit 1
-if ! command -v ffmpeg >/dev/null; then
+if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
   echo '请先通过 Homebrew 安装 FFmpeg：brew install ffmpeg'; read; exit 1
 fi
 (sleep 1; open http://127.0.0.1:8765) &
