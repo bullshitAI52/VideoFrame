@@ -22,6 +22,7 @@ python3 -m py_compile server.py
 node --check static/app.js
 python3 -m unittest discover -s tests -v
 node tests/test_frontend.cjs
+node tests/test_player.cjs
 ```
 
 Node.js 仅用于 JavaScript 语法检查，运行程序不需要 Node.js。
@@ -39,3 +40,9 @@ Node.js 仅用于 JavaScript 语法检查，运行程序不需要 Node.js。
 ## 后续维护
 
 待办见 [ROADMAP.md](../ROADMAP.md)。实现功能后同步更新功能说明、使用说明和更新记录，明确新增能力、行为变化和验证范围。
+
+## 原视频回看
+
+`GET /video?id=<已扫描的视频ID>` 按已登记路径读取原视频，支持单段 HTTP Range、尾部范围和无效范围 416 响应，未知 ID 或丢失文件返回 404。`static/player.js` 管理宫格点击、前 5 秒定位、倍速和弹窗关闭时的资源释放。
+
+新增测试覆盖视频完整读取、分段读取、无效范围、缺失文件、宫格坐标、空格排除及回看起点。已用合成 H.264 MP4 在浏览器实测解码、11/12 秒定位、两倍速及关闭停止；其他编码需按浏览器兼容性验证。

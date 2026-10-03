@@ -89,6 +89,28 @@ class ServerTests(unittest.TestCase):
                 self.assertTrue(app.S['sheets'][0]['favorite'])
                 self.assertEqual(len(app.S['sheets']),2)
 
+    def test_video_stream_ranges_and_unknown_ids(self):
+        path=app.DATA/'range-test.mp4';path.write_bytes(bytes(range(256))*32)
+        app.S['videos']=[{'id':'known','path':str(path)}]
+        server=app.ThreadingHTTPServer(('127.0.0.1',0),app.Handler)
+        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+        url=f'http://127.0.0.1:{server.server_port}/video?id=known'
+        try:
+            full=app.requests.get(url)
+            self.assertEqual(full.status_code,200)
+            self.assertEqual(full.content,path.read_bytes())
+            for header,start,end in [('bytes=10-19',10,19),('bytes=8000-',8000,8191),('bytes=-10',8182,8191),('bytes=8190-9999',8190,8191)]:
+                r=app.requests.get(url,headers={'Range':header})
+                self.assertEqual(r.status_code,206)
+                self.assertEqual(r.content,path.read_bytes()[start:end+1])
+                self.assertEqual(r.headers['Content-Range'],f'bytes {start}-{end}/8192')
+            for header in ['bytes=9000-','bytes=20-10','bytes=-0','bytes=0-1,3-4','garbage']:
+                self.assertEqual(app.requests.get(url,headers={'Range':header}).status_code,416)
+            self.assertEqual(app.requests.get(url.replace('known','missing')).status_code,404)
+            path.unlink()
+            self.assertEqual(app.requests.get(url).status_code,404)
+        finally:server.shutdown();server.server_close();thread.join()
+
     def test_invalid_ai_confidence_is_failed(self):
         folder=app.DATA/'ai';folder.mkdir(exist_ok=True)
         (folder/'sheet.jpg').write_bytes(b'test-image')

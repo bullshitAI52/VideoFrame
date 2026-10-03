@@ -159,8 +159,49 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*a):pass
     def respond(self,obj,status=200):
         b=json.dumps(obj,ensure_ascii=False).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+    def stream_video(self, video_id):
+        with LOCK:
+            video=next((dict(v) for v in S['videos'] if v['id']==video_id),None)
+        if not video:self.send_error(404,'Video not found');return
+        try:stream=Path(video['path']).open('rb')
+        except OSError:self.send_error(404,'Original video unavailable');return
+        with stream:
+            size=os.fstat(stream.fileno()).st_size
+            start,end=0,size-1
+            value=self.headers.get('Range')
+            if value:
+                import re
+                match=re.fullmatch(r'bytes=(\d*)-(\d*)',value.strip())
+                try:
+                    if not match or not any(match.groups()):raise ValueError()
+                    left,right=match.groups()
+                    if left:
+                        start=int(left);end=min(int(right),size-1) if right else size-1
+                    else:
+                        length=int(right)
+                        if length<=0:raise ValueError()
+                        start=max(0,size-length)
+                    if start>=size or start>end:raise ValueError()
+                except ValueError:
+                    self.send_response(416);self.send_header('Content-Range',f'bytes */{size}');self.send_header('Content-Length','0');self.end_headers();return
+            self.send_response(206 if value else 200)
+            self.send_header('Content-Type',mimetypes.guess_type(video['path'])[0] or 'application/octet-stream')
+            self.send_header('Accept-Ranges','bytes')
+            self.send_header('Content-Length',str(max(0,end-start+1)))
+            self.send_header('Cache-Control','no-store')
+            if value:self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
+            self.end_headers()
+            stream.seek(start);remaining=end-start+1
+            try:
+                while remaining>0:
+                    chunk=stream.read(min(1024*1024,remaining))
+                    if not chunk:break
+                    self.wfile.write(chunk);remaining-=len(chunk)
+            except (BrokenPipeError,ConnectionResetError):pass
     def do_GET(self):
         u=urlparse(self.path)
+        if u.path=='/video':
+            self.stream_video(parse_qs(u.query).get('id',[''])[0]);return
         if u.path=='/api/state':
             with LOCK:self.respond(dict(S,busy=BUSY,ffmpeg=bool(shutil.which('ffmpeg') and shutil.which('ffprobe')),config={'base_url':C['base_url'],'model':C['model'],'has_key':bool(C['key'])}))
             return
